@@ -204,7 +204,7 @@ isa 的类型 isa_t 是一个 union 类型的结构体，也就是说其中的 i
 内存中的数据类型分为两种：值类型和引用类型。指针就是引用类型，struct 类型就是值类型。
 
 
-值类型在传值时需要拷贝内容本身，而引用类型在传递时，拷贝的是对象的地址。所以，一方面，值类型的传递占用更多的内存空间，使用引用类型更节省内存开销；另一方面，也是最主要的原因，很多时候，我们需要把一个对象交给另一个函数或者方法去修改其中的内容（比如说一个 Person 对象的 age 属性），显然如果我们想让修改方获取到这个对象，我们需要的传递的是地址，而不是复制一份。
+值类型在传值时需要拷贝内容本身，而引用类型在传递时，拷贝的是对象的地址。所以，一方面，值类型的传递占用更多的内存空间，使用引用类型更节省内存开销；另一方面，也是最主要的原因(Really？?)，很多时候，我们需要把一个对象交给另一个函数或者方法去修改其中的内容（比如说一个 Person 对象的 age 属性），显然如果我们想让修改方获取到这个对象，我们需要的传递的是地址，而不是复制一份。
 
 对于像 `int` 这样的基本数据类型，拷贝起来更快，而且数据简单，方便修改，所以就不用指针了。
 
@@ -216,6 +216,7 @@ isa 的类型 isa_t 是一个 union 类型的结构体，也就是说其中的 i
 - [need of pointer objects in objective c](https://stackoverflow.com/questions/17992127/need-of-pointer-objects-in-objective-c)
 - [Why "Everything" in Objective C is pointers. I mean why I should declare NSArray instance variables in pointers.](https://teamtreehouse.com/community/why-everything-in-objective-c-is-pointers-i-mean-why-i-should-declare-nsarray-instance-variables-in-pointers)
 - [Why do all objects in Objective-C have to use pointers?](https://www.quora.com/Why-do-all-objects-in-Objective-C-have-to-use-pointers#)
+- [Swift and mutating struct](https://stackoverflow.com/a/24035861)
 
 ### 4. Objective-C 对象是如何被创建（alloc）和初始化（init）的？
 
@@ -886,10 +887,16 @@ static SEL sel_alloc(const char *name, bool copy)
 
 ### 10. Method Swizzling
 
-- 什么是 Method Swizzling ？
-- Method Swizzling 有什么注意点？
+- 什么是 Method Swizzling ？一般用来干什么？
 - Method Swizzling 的原理是什么？
+- Method Swizzling 有什么注意点？最佳实践是什么？
 - Method Swizzling 为什么要在 +load 方法中进行？
+
+参考：
+- [Objective-C Method Swizzling - 玉令天下](http://yulingtianxia.com/blog/2017/04/17/Objective-C-Method-Swizzling/)
+- [What are the Dangers of Method Swizzling in Objective-C? - Stack Overflow](https://stackoverflow.com/questions/5339276/what-are-the-dangers-of-method-swizzling-in-objective-c)
+- [Method Swizzling - NSHipster](https://nshipster.cn/method-swizzling/)
+- [Objective-C Method Swizzling 的最佳实践 - 雷纯锋的技术博客](http://www.ds99.site/blog/2015/06/14/objective-c-method-swizzling-best-practice/)
 
 ### 11. Category
 
@@ -897,11 +904,172 @@ static SEL sel_alloc(const char *name, bool copy)
 - Category 中的方法和属性以及协议是怎么存储和加载的？
 - Category 和 Class 的关系
 
+参考：
+- [深入理解Objective-C：Category - 美团技术团队](https://tech.meituan.com/DiveIntoCategory.html)
+- [Objective-C Category 的实现原理 - 雷纯锋的技术博客](http://www.ds99.site/blog/2015/05/18/objective-c-category-implementation-principle/)
+
 ### 12. Associated Objects 的原理是什么？到底能不能在 Category 中给 Objective-C 类添加属性和实例变量？
 
-- Associated Objects 的原理是什么？
-- Associated Objects 的内存管理机制？
-- 到底能不能在 Category 中给 Objective-C 类添加属性和实例变量？
+我们需要知道以下几个问题：
+- Associated Objects 的应用场景
+- Associated Objects 相关函数介绍
+- Associated Objects 的原理是什么？Associated Objects 被存储在什么地方，是不是存放在被关联对象本身的内存中？
+- Associated Objects 的五种 policy 有什么区别，有什么坑？
+- Associated Objects 的内存管理机制是什么？生命周期是怎样的，什么时候被释放，什么时候被移除？
+
+#### 12.1 使用场景
+
+- 为现有的类添加私有变量以帮助实现细节
+- 为现有的类添加公有属性
+- 为 KVO 创建一个关联的观察者
+
+#### 12.2 相关函数
+
+`objc/runtime.h` 文件中可以看到：
+
+```Objective-C
+/// 用于给对象添加关联对象，传入 nil 则可以移除已有的关联对象
+void objc_setAssociatedObject(id object, const void *key, id value, objc_AssociationPolicy policy); 
+
+/// 用于获取关联对象
+id objc_getAssociatedObject(id object, const void *key);
+
+/// 用于移除一个对象的所有关联对象
+void objc_removeAssociatedObjects(id object);
+
+```
+
+#### 12.3 `objc_setAssociatedObject` 的第二个参数 `const void *key`
+
+`void *` 一般被称为通用指针或泛指针，它是C关于“纯粹地址(raw address)”的一种约定。void 指针指向某个对象，但该对象不属于任何类型。请看下例：
+```
+    int    *ip;
+    void    *p;
+```
+在上例中，ip 指向一个整型值，而 p 指向的对象不属于任何类型。
+在 C 中，任何时候你都可以用其它类型的指针来代替 void 指针(在 C++ 中同样可以)，或者用 void 指针来代替其它类型的指针(在 C++ 中需要进行强制转换)，并且不需要进行强制转换。例如，你可以把 `char *` 类型的指针传递给需要 void 指针的函数。
+
+`const` 表示这个一个常量。
+
+所以，传入的第二参数必须是一个唯一的对象级别的常量。从 runtime 源码中，可以看到这个 key 最后被用来从 [std::map](https://en.cppreference.com/w/cpp/container/map) 中查找对应的 value。
+
+```C++
+/// 比较器的定义
+struct ObjectPointerLess {
+    bool operator()(const void *p1, const void *p2) const {
+        return p1 < p2;
+    }
+};
+
+/// 最终保存关联对象的 Map
+class ObjectAssociationMap : public std::map<void *, ObjcAssociation, ObjectPointerLess, ObjectAssociationMapAllocator>
+ 
+...
+
+/// 访问关联对象的逻辑
+ObjectAssociationMap *refs = i->second;
+ObjectAssociationMap::iterator j = refs->find(key);
+if (j != refs->end()) {
+    old_association = j->second;
+    j->second = ObjcAssociation(policy, new_value);
+} else {
+    (*refs)[key] = ObjcAssociation(policy, new_value);
+}
+...
+```
+一般来说，有以下三种推荐的 `key` 值：
+- 声明 `static char kAssociatedObjectKey;` ，使用时 `objc_getAssociatedObject(self, &kAssociatedObjectKey);`；
+- 声明 `static void *kAssociatedObjectKey = &kAssociatedObjectKey;` ，使用时 `objc_getAssociatedObject(self, &kAssociatedObjectKey);`；
+- 直接使用 getter 的 selector 作为 key，使用时 `objc_getAssociatedObject(self, @selector(associatedObjectGetterName));`，而且在 getter 中可以直接写成 `objc_getAssociatedObject(self, _cmd);`。
+
+
+#### 12.4 Associated Objects 的原理是什么？Associated Objects 被存储在什么地方？
+
+
+我们可以在 `objc-references.mm` 中的 `_object_set_associative_reference` 函数中，看到 `objc_setAssociatedObject` 的核心逻辑：
+```Objective-C++
+    void _object_set_associative_reference(id object, void *key, id value, uintptr_t policy) {
+    // retain the new value (if any) outside the lock.
+    ObjcAssociation old_association(0, nil);
+    id new_value = value ? acquireValue(value, policy) : nil;
+    {
+        AssociationsManager manager;
+        AssociationsHashMap &associations(manager.associations());
+        disguised_ptr_t disguised_object = DISGUISE(object);
+        if (new_value) {
+            // break any existing association.
+            AssociationsHashMap::iterator i = associations.find(disguised_object);
+            if (i != associations.end()) {
+                // secondary table exists
+                ObjectAssociationMap *refs = i->second;
+                ObjectAssociationMap::iterator j = refs->find(key);
+                if (j != refs->end()) {
+                    old_association = j->second;
+                    j->second = ObjcAssociation(policy, new_value);
+                } else {
+                    (*refs)[key] = ObjcAssociation(policy, new_value);
+                }
+            } else {
+                // create the new association (first time).
+                ObjectAssociationMap *refs = new ObjectAssociationMap;
+                associations[disguised_object] = refs;
+                (*refs)[key] = ObjcAssociation(policy, new_value);
+                object->setHasAssociatedObjects();
+            }
+        } else {
+            // setting the association to nil breaks the association.
+            AssociationsHashMap::iterator i = associations.find(disguised_object);
+            if (i !=  associations.end()) {
+                ObjectAssociationMap *refs = i->second;
+                ObjectAssociationMap::iterator j = refs->find(key);
+                if (j != refs->end()) {
+                    old_association = j->second;
+                    refs->erase(j);
+                }
+            }
+        }
+    }
+    // release the old value (outside of the lock).
+    if (old_association.hasValue()) ReleaseValue()(old_association);
+}
+```
+
+核心逻辑其实就是 4 个数据结构：
+- `AssociationsManager` 是顶级的对象，维护了一个从 `spinlock_t` 锁到 `AssociationsHashMap` 哈希表的单例键值对映射；
+- `AssociationsHashMap` 是一个无序的哈希表，维护了从对象地址到 `ObjectAssociationMap` 的映射；
+- `ObjectAssociationMap` 是一个 C++ 中的 `map` ，维护了从 `key` 到 `ObjcAssociation` 的映射，即关联记录；
+- `ObjcAssociation` 是一个 C++ 的类，表示一个具体的关联结构，主要包括两个实例变量，`_policy` 表示关联策略，`_value` 表示关联对象。
+
+
+#### 12.5 Associated Objects 的内存管理机制是什么？
+
+
+|              关联策略               |                           等价属性                           |              说明              |
+| :---------------------------------: | :----------------------------------------------------------: | :----------------------------: |
+|      `OBJC_ASSOCIATION_ASSIGN`      | `@property (assign)` <br /> or `@property (unsafe_unretained) ` |         弱引用关联对象         |
+| `OBJC_ASSOCIATION_RETAIN_NONATOMIC` |               `@property (strong, nonatomic)`                | 强引用关联对象，且为非原子操作 |
+|  `OBJC_ASSOCIATION_COPY_NONATOMIC`  |                `@property (copy, nonatomic)`                 |  复制关联对象，且为非原子操作  |
+|      `OBJC_ASSOCIATION_RETAIN`      |                 `@property (strong, atomic)`                 |  强引用关联对象，且为原子操作  |
+|       `OBJC_ASSOCIATION_COPY`       |                  `@property (copy, atomic)`                  |   复制关联对象，且为原子操作   |
+
+
+
+   
+
+
+​		
+​		
+​		
+​		
+
+
+参考：
+- [Objective-C Associated Objects 的实现原理 - 雷纯锋的技术博客](http://www.ds99.site/blog/2015/06/26/objective-c-associated-objects-implementation-principle/)
+- [Associated Objects - NSHipster](https://nshipster.com/associated-objects/)
+- [The Objective-C Programming Language - Apple](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ObjectiveC/Chapters/ocAssociativeReferences.html)
+- [Associated Object 与 Dealloc - 玉令天下](http://yulingtianxia.com/blog/2017/12/15/Associated-Object-and-Dealloc/)
+- [关联对象 AssociatedObject 完全解析 - Draveness](https://draveness.me/ao/)
+- [C语言void指针到底是什么?什么时候使用void指针? - C 语言中文网](http://c.biancheng.net/cpp/html/1582.html)
 
 
 ### 13. Objective-C 中的 Protocol 是什么？
@@ -1038,6 +1206,9 @@ static instancetype _I_NyanCat_init(NyanCat * self, SEL _cmd) {
 - 这两个方法是用来干嘛的？
 - ProtocolKit 的实现中为什么要在 main 函数执行前进行 Protocol 方法默认实现的注册？
 
+参考：
+- [Objective-C +load vs +initialize - 雷纯锋的技术博客](http://www.ds99.site/blog/2015/05/02/objective-c-plus-load-vs-plus-initialize/)
+- [孙源：iOS 程序 main 函数之前发生了什么](http://blog.sunnyxx.com/2014/08/30/objc-pre-main/)
 
 ### 延伸
 
