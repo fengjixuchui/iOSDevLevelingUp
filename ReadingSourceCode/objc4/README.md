@@ -901,12 +901,29 @@ static SEL sel_alloc(const char *name, bool copy)
 ### 11. Category
 
 - Category 是什么？
+- Category 的使用注意点
 - Category 中的方法和属性以及协议是怎么存储和加载的？
 - Category 和 Class 的关系
+
+#### 11.1 应用场景
+
+在 Objective-C 2.0 中，提供了 Category 这个语言特性，可以动态地为已有类添加新行为。
+
+- 给已经存在的类添加方法
+- 将一个类的实现拆分成多个独立的源文件
+- 声明私有的方法
+
+#### 11.2 注意点
+
+- 不要用 Category 来覆写原类的方法。因为这样可能会导致原类中的方法不再被调用。
+- 同理，不要用 Category 来覆写父类的方法。因为如果原类中也覆盖了父类的这个方法，这样还是会遇到上面的第一个问题。
+- 不要用 Category 来覆写原类其他 Category 中定义的方法。因为哪个 Category 中的方法会最先被调用是不可预知的。
 
 参考：
 - [深入理解Objective-C：Category - 美团技术团队](https://tech.meituan.com/DiveIntoCategory.html)
 - [Objective-C Category 的实现原理 - 雷纯锋的技术博客](http://www.ds99.site/blog/2015/05/18/objective-c-category-implementation-principle/)
+- [Cocoa Core Competencies - Apple](https://developer.apple.com/library/archive/documentation/General/Conceptual/DevPedia-CocoaCore/Category.html)
+- [Overriding methods using categories in Objective-C - Stack Overflow](https://stackoverflow.com/questions/5272451/overriding-methods-using-categories-in-objective-c)
 
 ### 12. Associated Objects 的原理是什么？到底能不能在 Category 中给 Objective-C 类添加属性和实例变量？
 
@@ -1053,15 +1070,51 @@ if (j != refs->end()) {
 |       `OBJC_ASSOCIATION_COPY`       |                  `@property (copy, atomic)`                  |   复制关联对象，且为原子操作   |
 
 
+一个 Objective-C 对象的 `dealloc` 方法的调用顺序是从子类到父类直至 `NSObject` 的，`NSObject` 的 `dealloc` 会调用 `object_dispose()` 函数，进而移除 `Associated Object`。具体的实现如下:
+```Objective-C++
+id object_dispose(id obj)
+{
+    if (!obj) return nil;
+	// 销毁对象
+    objc_destructInstance(obj);    
+  // 释放内存
+    free(obj);
 
-   
+    return nil;
+}
 
+void *objc_destructInstance(id obj) 
+{
+    if (obj) {
+        // Read all of the flags at once for performance.
+        bool cxx = obj->hasCxxDtor();
+        bool assoc = obj->hasAssociatedObjects();
 
-​		
-​		
-​		
-​		
+        // This order is important.
+        // C++ 析构
+        if (cxx) object_cxxDestruct(obj);
+        // 移除 Associated Object
+        if (assoc) _object_remove_assocations(obj);
+        // ARC 下调用实例变量的 release 方法，移除 weak 引用
+        obj->clearDeallocating();
+    }
 
+    return obj;
+}
+```
+
+结论：
+- 关联对象的五种关联策略与属性的限定符非常类似，在绝大多数情况下，我们都会使用 `OBJC_ASSOCIATION_RETAIN_NONATOMIC` 的关联策略，这可以保证我们持有关联对象
+- 关联对象的释放时机跟对应的等价属性的释放时机基本一致，都是系统 ARC 自动管理的，在“宿主对象” dealloc 被调用时，先析构“宿主对象”自己，然后再移除关联对象
+- 关联对象的释放时机与移除时机并不总是一致，跟 `assgin` 和 `unsafe_unretained` 类似，属性用关联策略 `OBJC_ASSOCIATION_ASSIGN` 进行关联的对象，很早就已经被释放了，但是并没有被移除，而再使用这个关联对象时就会造成 Crash
+
+#### 12.6 如何实现 Weak Associated Object?
+
+两种方式：
+- `host --> wrapper(retain) --> obj(weak)` ：“宿主对象”通过 retain 方式的关联一个 Wrapper 对象，Wrapper 对象再持有一个 weak 属性去保存真正要关联的那个对象
+- `host --> obj(retain) --> TempObject.block(retain) --> notify host to nil out obj when dealloc`：“宿主对象” 通过 retain 方式的关联目标对象，目标对象再通过 retain 方式的关联一个中间对象 dealloc 回调的 block。当目标对象被释放时，中间对象也被释放了，block 回调通知“宿主对象”清空属性，也就是关联对象的值。
+
+实现代码详见[如何实现 Weak Associated Object](https://zhangbuhuai.com/post/weak-associated-object.html)。
 
 参考：
 - [Objective-C Associated Objects 的实现原理 - 雷纯锋的技术博客](http://www.ds99.site/blog/2015/06/26/objective-c-associated-objects-implementation-principle/)
@@ -1070,6 +1123,7 @@ if (j != refs->end()) {
 - [Associated Object 与 Dealloc - 玉令天下](http://yulingtianxia.com/blog/2017/12/15/Associated-Object-and-Dealloc/)
 - [关联对象 AssociatedObject 完全解析 - Draveness](https://draveness.me/ao/)
 - [C语言void指针到底是什么?什么时候使用void指针? - C 语言中文网](http://c.biancheng.net/cpp/html/1582.html)
+- [如何实现 Weak Associated Object](https://zhangbuhuai.com/post/weak-associated-object.html)
 
 
 ### 13. Objective-C 中的 Protocol 是什么？
