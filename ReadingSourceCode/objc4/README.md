@@ -919,8 +919,218 @@ static SEL sel_alloc(const char *name, bool copy)
 - 同理，不要用 Category 来覆写父类的方法。因为如果原类中也覆盖了父类的这个方法，这样还是会遇到上面的第一个问题。
 - 不要用 Category 来覆写原类其他 Category 中定义的方法。因为哪个 Category 中的方法会最先被调用是不可预知的。
 
+#### 11.3 category VS. extension
+
+美团技术团队的博客总结的很好：
+> extension看起来很像一个匿名的category，但是extension和有名字的category几乎完全是两个东西。 extension在编译期决议，它就是类的一部分，在编译期和头文件里的@interface以及实现文件里的@implement一起形成一个完整的类，它伴随类的产生而产生，亦随之一起消亡。extension一般用来隐藏类的私有信息，你必须有一个类的源码才能为一个类添加extension，所以你无法为系统的类比如NSString添加extension。
+> 
+> 但是category则完全不一样，它是在运行期决议的。 就category和extension的区别来看，我们可以推导出一个明显的事实，extension可以添加实例变量，而category是无法添加实例变量的（因为在运行期，对象的内存布局已经确定，如果添加实例变量就会破坏类的内部布局，这对编译型语言来说是灾难性的）。
+
+#### 11.4 源码实现
+
+##### （1）Category 的真实面目
+在 `objc-runtime-new.h` 中可以找到 Category 在 runtime 层面的定义：
+
+```
+struct category_t {
+    const char *name; // 分类名
+    classref_t cls;  // 原类
+    struct method_list_t *instanceMethods; // 实例方法列表
+    struct method_list_t *classMethods;    // 类方法列表
+    struct protocol_list_t *protocols;     // 协议列表
+    struct property_list_t *instanceProperties;  // 实例属性列表
+    // Fields below this point are not always present on disk.
+    struct property_list_t *_classProperties;  // 类属性列表
+
+    method_list_t *methodsForMeta(bool isMeta) {
+        if (isMeta) return classMethods;
+        else return instanceMethods;
+    }
+
+    property_list_t *propertiesForMeta(bool isMeta, struct header_info *hi);
+};
+```
+
+定义一个 Category，然后再使用 `clang -rewrite-objc MyCategory.m`，也可以看到 Category 经过编译器处理后的样子。详见 [深入理解Objective-C：Category - 美团技术团队](https://tech.meituan.com/DiveIntoCategory.html)。
+
+##### （2）Category (方法、属性等)的加载过程
+
+Objective-C 的运行是依赖 ObjC 的 runtime 的，而 ObjC 的 runtime 和其他系统库一样，是 macOS 和 iOS 通过 dyld 动态加载的。
+
+ObjC runtime 的加载是从 `objc-os.mm` 中的 `_objc_init` 函数开始的，其中加载 Category 大概流程如下：
+```Objective-C++
+_objc_init()
+  _dyld_objc_notify_register()
+    map_images()
+      map_images_nolock()
+        _read_images()
+	  addUnattachedCategoryForClass() // 把 category 和原类做一个关联映射
+	  remethodizeClass()              // 把 category 的实例方法/类方法、协议以及属性/类属性添加到原类/元类上
+	    attachCategories()
+```
+
+加载 Category 属性和方法的主要逻辑都在 `attachCategories` 函数中：
+```
+// Attach method lists and properties and protocols from categories to a class.
+// Assumes the categories in cats are all loaded and sorted by load order, 
+// oldest categories first.
+static void 
+attachCategories(Class cls, category_list *cats, bool flush_caches)
+{
+    if (!cats) return;
+    if (PrintReplacedMethods) printReplacements(cls, cats);
+
+    bool isMeta = cls->isMetaClass();
+
+    // fixme rearrange to remove these intermediate allocations
+    method_list_t **mlists = (method_list_t **)
+        malloc(cats->count * sizeof(*mlists));
+    property_list_t **proplists = (property_list_t **)
+        malloc(cats->count * sizeof(*proplists));
+    protocol_list_t **protolists = (protocol_list_t **)
+        malloc(cats->count * sizeof(*protolists));
+
+    // Count backwards through cats to get newest categories first
+    int mcount = 0;
+    int propcount = 0;
+    int protocount = 0;
+    int i = cats->count;
+    bool fromBundle = NO;
+    while (i--) {
+        auto& entry = cats->list[i];
+
+        method_list_t *mlist = entry.cat->methodsForMeta(isMeta);
+        if (mlist) {
+            mlists[mcount++] = mlist;
+            fromBundle |= entry.hi->isBundle();
+        }
+
+        property_list_t *proplist = 
+            entry.cat->propertiesForMeta(isMeta, entry.hi);
+        if (proplist) {
+            proplists[propcount++] = proplist;
+        }
+
+        protocol_list_t *protolist = entry.cat->protocols;
+        if (protolist) {
+            protolists[protocount++] = protolist;
+        }
+    }
+
+    auto rw = cls->data();
+
+    prepareMethodLists(cls, mlists, mcount, NO, fromBundle);
+    rw->methods.attachLists(mlists, mcount);
+    free(mlists);
+    if (flush_caches  &&  mcount > 0) flushCaches(cls);
+
+    rw->properties.attachLists(proplists, propcount);
+    free(proplists);
+
+    rw->protocols.attachLists(protolists, protocount);
+    free(protolists);
+}
+```
+
+`attachLists` 函数做的工作就是把类中原有的方法(或者属性和协议)放到了新添加的 category (或者属性和协议)的后面了，代码实现如下：
+
+```
+void attachLists(List* const * addedLists, uint32_t addedCount) {
+        if (addedCount == 0) return;
+
+        if (hasArray()) {
+            // many lists -> many lists
+            uint32_t oldCount = array()->count;
+            uint32_t newCount = oldCount + addedCount;
+            setArray((array_t *)realloc(array(), array_t::byteSize(newCount)));
+            array()->count = newCount;
+            memmove(array()->lists + addedCount, array()->lists, 
+                    oldCount * sizeof(array()->lists[0]));
+            memcpy(array()->lists, addedLists, 
+                   addedCount * sizeof(array()->lists[0]));
+        }
+        
+	// 后面的内容省略了...
+    }
+```
+
+结论：
+- category的方法没有“完全替换掉”原来类已经有的方法，也就是说如果 category 和原来类都有 methodA，那么 category 附加完成之后，类的方法列表里会有两个 methodA
+- category的方法被放到了新方法列表的前面，而原来类的方法被放到了新方法列表的后面，这也就是我们平常所说的 category 的方法会“覆盖”掉原来类的同名方法，这是因为运行时在查找方法的时候是顺着方法列表的顺序查找的，它只要一找到对应名字的方法，就停止查找，不会再关心后面是不是还有一样名字的方法。
+
+#### 11.5 category 和 `+load` 方法
+
+（1）我们可以在一个类的 `+load` 方法中调用 category 中声明的方法么？
+
+可以调用，因为 attatch category 到类的工作是在 `map_images` 阶段调用的(前面提到过)，而 ObjC 类的 `+load` 方法是在 `load_images` 阶段调用的，前者比后者要早。这一点通过符号断点也可以验证。
+
+runtime 加载时，`_objc_init` 函数中会调用到 `_dyld_objc_notify_register`：
+```
+void _objc_init(void)
+{
+    static bool initialized = false;
+    if (initialized) return;
+    initialized = true;
+    
+    // fixme defer initialization until an objc-using image is found?
+    environ_init();
+    tls_init();
+    static_init();
+    lock_init();
+    exception_init();
+
+    _dyld_objc_notify_register(&map_images, load_images, unmap_image);
+}
+```
+而 `_dyld_objc_notify_register` 函数会在适当的时机分别调用 `map_images` 函数和 `load_images` 函数：
+```
+//
+// Note: only for use by objc runtime
+// Register handlers to be called when objc images are mapped, unmapped, and initialized.
+// Dyld will call back the "mapped" function with an array of images that contain an objc-image-info section.
+// Those images that are dylibs will have the ref-counts automatically bumped, so objc will no longer need to
+// call dlopen() on them to keep them from being unloaded.  During the call to _dyld_objc_notify_register(),
+// dyld will call the "mapped" function with already loaded objc images.  During any later dlopen() call,
+// dyld will also call the "mapped" function.  Dyld will call the "init" function when dyld would be called
+// initializers in that image.  This is when objc calls any +load methods in that image.
+//
+void _dyld_objc_notify_register(_dyld_objc_notify_mapped    mapped,
+                                _dyld_objc_notify_init      init,
+                                _dyld_objc_notify_unmapped  unmapped);
+
+```
+`load_images` 函数中调用了各个类和 Category 的 `+load` 方法：
+```
+void load_images(const char *path __unused, const struct mach_header *mh)
+{
+    // Return without taking locks if there are no +load methods here.
+    if (!hasLoadMethods((const headerType *)mh)) return;
+
+    recursive_mutex_locker_t lock(loadMethodLock);
+
+    // Discover load methods
+    {
+        rwlock_writer_t lock2(runtimeLock);
+        prepare_load_methods((const headerType *)mh);
+    }
+
+    // Call +load methods (without runtimeLock - re-entrant)
+    call_load_methods();
+}
+```
+
+
+（2）如果一个类和它的各个 category 中都重写了 `+load` 方法，那么调用顺序是怎样的呢？
+
+`+load` 的执行顺序是先调用类的 `+load`，后调用 category 的，而 category 的 `+load` 执行顺序是根据类的编译顺序(在 Xcode Build phases 里面可以看到)决定的。
+
+（3）如果一个类中和它的各个 category 中都实现了相同的方法，会发生什么？
+
+对于 Category 覆写的方法，运行时的消息机制会先找到方法列表中第一个匹配的方法，也就是最后一个编译的 category 里的对应方法。因为上面提到过，各个 Category 中的方法是逆序排列的，而且 Category 的方法被插入到了原类中方法的前面。 
+
+
 参考：
-- [深入理解Objective-C：Category - 美团技术团队](https://tech.meituan.com/DiveIntoCategory.html)
+- [深入理解Objective-C：Category - 美团技术团队](https://tech.meituan.com/DiveIntoCategory.html) ⭐️
 - [Objective-C Category 的实现原理 - 雷纯锋的技术博客](http://www.ds99.site/blog/2015/05/18/objective-c-category-implementation-principle/)
 - [Cocoa Core Competencies - Apple](https://developer.apple.com/library/archive/documentation/General/Conceptual/DevPedia-CocoaCore/Category.html)
 - [Overriding methods using categories in Objective-C - Stack Overflow](https://stackoverflow.com/questions/5272451/overriding-methods-using-categories-in-objective-c)
@@ -1050,9 +1260,25 @@ if (j != refs->end()) {
     if (old_association.hasValue()) ReleaseValue()(old_association);
 }
 ```
+最顶层的数据结构 `AssociationsManager` 的定义如下：
+```
+class AssociationsManager {
+    // associative references: object pointer -> PtrPtrHashMap.
+    static AssociationsHashMap *_map;
+public:
+    AssociationsManager()   { AssociationsManagerLock.lock(); }
+    ~AssociationsManager()  { AssociationsManagerLock.unlock(); }
+    
+    AssociationsHashMap &associations() {
+        if (_map == NULL)
+            _map = new AssociationsHashMap();
+        return *_map;
+    }
+};
+```
 
 核心逻辑其实就是 4 个数据结构：
-- `AssociationsManager` 是顶级的对象，维护了一个从 `spinlock_t` 锁到 `AssociationsHashMap` 哈希表的单例键值对映射；
+- `AssociationsManager` 是最顶层的对象，其中有一个静态的 map，所以可以看做是一个单例，它维护了一个从 `spinlock_t` 锁到 `AssociationsHashMap` 哈希表的单例键值对映射；
 - `AssociationsHashMap` 是一个无序的哈希表，维护了从对象地址到 `ObjectAssociationMap` 的映射；
 - `ObjectAssociationMap` 是一个 C++ 中的 `map` ，维护了从 `key` 到 `ObjcAssociation` 的映射，即关联记录；
 - `ObjcAssociation` 是一个 C++ 的类，表示一个具体的关联结构，主要包括两个实例变量，`_policy` 表示关联策略，`_value` 表示关联对象。
@@ -1256,12 +1482,187 @@ static instancetype _I_NyanCat_init(NyanCat * self, SEL _cmd) {
 ### 15. load 方法和 initialize 方法
 
 
-- `+load ` 方法和 `+initialize` 方法分别在什么时候被调用？
+- `+load` 方法和 `+initialize` 方法分别在什么时候被调用？，在父类、子类和分类中的调用顺序是什么？
 - 这两个方法是用来干嘛的？
 - ProtocolKit 的实现中为什么要在 main 函数执行前进行 Protocol 方法默认实现的注册？
 
+> `+load` 方法是当类或分类被添加到 Objective-C runtime 时被调用的，实现这个方法可以让我们在类加载的时候执行一些类相关的行为。
+
+
+
+#### 15.1 `+load` 方法
+
+在 runtime 动态库加载的入口函数 `_objc_init` 设置符号断点，启动程序，可以看到如下堆栈：
+
+```
+#0	0x00007fff201b300d in _objc_init ()
+#1	0x00000001002e36db in _os_object_init ()
+#2	0x00000001002f4928 in libdispatch_init ()
+#3	0x00007fff2a4fe65b in libSystem_initializer ()
+#4	0x000000010002d079 in ImageLoaderMachO::doModInitFunctions(ImageLoader::LinkContext const&) ()
+#5	0x000000010002d478 in ImageLoaderMachO::doInitialization(ImageLoader::LinkContext const&) ()
+#6	0x0000000100027d1a in ImageLoader::recursiveInitialization(ImageLoader::LinkContext const&, unsigned int, char const*, ImageLoader::InitializerTimingList&, ImageLoader::UninitedUpwards&) ()
+#7	0x0000000100027c85 in ImageLoader::recursiveInitialization(ImageLoader::LinkContext const&, unsigned int, char const*, ImageLoader::InitializerTimingList&, ImageLoader::UninitedUpwards&) ()
+#8	0x0000000100025b82 in ImageLoader::processInitializers(ImageLoader::LinkContext const&, unsigned int, ImageLoader::InitializerTimingList&, ImageLoader::UninitedUpwards&) ()
+#9	0x0000000100025c22 in ImageLoader::runInitializers(ImageLoader::LinkContext const&, ImageLoader::InitializerTimingList&) ()
+#10	0x00000001000125e9 in dyld::initializeMainExecutable() ()
+#11	0x00000001000189a4 in dyld::_main(macho_header const*, unsigned long, int, char const**, char const**, char const**, unsigned long*) ()
+#12	0x000000010001122b in dyldbootstrap::start(dyld3::MachOLoaded const*, int, char const**, dyld3::MachOLoaded const*, unsigned long*) ()
+#13	0x0000000100011025 in _dyld_start ()
+```
+
+接着在设置断点`map_images`，函数堆栈如下：
+```
+#0	0x00007fff201c4fe1 in map_images ()
+#1	0x0000000100015d2c in dyld::notifyBatchPartial(dyld_image_states, bool, char const* (*)(dyld_image_states, unsigned int, dyld_image_info const*), bool, bool) ()
+#2	0x0000000100015ecf in dyld::registerObjCNotifiers(void (*)(unsigned int, char const* const*, mach_header const* const*), void (*)(char const*, mach_header const*), void (*)(char const*, mach_header const*)) ()
+#3	0x00007fff203228ff in _dyld_objc_notify_register ()
+#4	0x00007fff201b34d9 in _objc_init ()
+#5	0x00000001002e36db in _os_object_init ()
+#6	0x00000001002f4928 in libdispatch_init ()
+#7	0x00007fff2a4fe65b in libSystem_initializer ()
+#8	0x000000010002d079 in ImageLoaderMachO::doModInitFunctions(ImageLoader::LinkContext const&) ()
+#9	0x000000010002d478 in ImageLoaderMachO::doInitialization(ImageLoader::LinkContext const&) ()
+#10	0x0000000100027d1a in ImageLoader::recursiveInitialization(ImageLoader::LinkContext const&, unsigned int, char const*, ImageLoader::InitializerTimingList&, ImageLoader::UninitedUpwards&) ()
+#11	0x0000000100027c85 in ImageLoader::recursiveInitialization(ImageLoader::LinkContext const&, unsigned int, char const*, ImageLoader::InitializerTimingList&, ImageLoader::UninitedUpwards&) ()
+#12	0x0000000100025b82 in ImageLoader::processInitializers(ImageLoader::LinkContext const&, unsigned int, ImageLoader::InitializerTimingList&, ImageLoader::UninitedUpwards&) ()
+#13	0x0000000100025c22 in ImageLoader::runInitializers(ImageLoader::LinkContext const&, ImageLoader::InitializerTimingList&) ()
+#14	0x00000001000125e9 in dyld::initializeMainExecutable() ()
+#15	0x00000001000189a4 in dyld::_main(macho_header const*, unsigned long, int, char const**, char const**, char const**, unsigned long*) ()
+#16	0x000000010001122b in dyldbootstrap::start(dyld3::MachOLoaded const*, int, char const**, dyld3::MachOLoaded const*, unsigned long*) ()
+#17	0x0000000100011025 in _dyld_start ()
+
+```
+
+最后再在一个类的 `+load` 方法处设置断点，得到函数堆栈如下：
+```
+#0	0x000000010000378c in +[Dog load] at /Users/ShannonChen/Desktop/Playgrounds/ObjCPlayground/ObjCPlayground/Dog.m:15
+#1	0x00007fff201b79e9 in load_images ()
+#2	0x000000010001228a in dyld::notifySingle(dyld_image_states, ImageLoader const*, ImageLoader::InitializerTimingList*) ()
+#3	0x0000000100027d08 in ImageLoader::recursiveInitialization(ImageLoader::LinkContext const&, unsigned int, char const*, ImageLoader::InitializerTimingList&, ImageLoader::UninitedUpwards&) ()
+#4	0x0000000100025b82 in ImageLoader::processInitializers(ImageLoader::LinkContext const&, unsigned int, ImageLoader::InitializerTimingList&, ImageLoader::UninitedUpwards&) ()
+#5	0x0000000100025c22 in ImageLoader::runInitializers(ImageLoader::LinkContext const&, ImageLoader::InitializerTimingList&) ()
+#6	0x000000010001262f in dyld::initializeMainExecutable() ()
+#7	0x00000001000189a4 in dyld::_main(macho_header const*, unsigned long, int, char const**, char const**, char const**, unsigned long*) ()
+#8	0x000000010001122b in dyldbootstrap::start(dyld3::MachOLoaded const*, int, char const**, dyld3::MachOLoaded const*, unsigned long*) ()
+#9	0x0000000100011025 in _dyld_start ()
+```
+
+大概过程如下：
+- dyld 开始将程序二进制文件初始化
+- 交由 ImageLoader 读取 image，其中包含了我们的类、方法等各种符号
+- 由于 runtime 向 dyld 绑定了回调，当 image 加载到内存后，dyld 会通知 runtime 进行处理
+- runtime 接手后调用 `map_images` 做解析和处理，接下来 `load_images` 中调用 `call_load_methods` 方法，遍历所有加载进来的 Class，按继承层级依次调用 Class 的 `+load` 方法和其 Category 的 `+load` 方法
+
+
+根据 runtime 源码，加载 objc runtime 时调用 `+load` 方法的流程如下：
+
+```
+_objc_init()
+  _dyld_objc_notify_register()
+    map_images()  // 先映射二进制数据
+    load_images() // 然后加载二进制数据
+      prepare_load_methods()
+        schedule_class_load()
+	  schedule_class_load() // 确保父类优先
+	  add_class_to_loadable_list()
+	    getLoadMethod() // 获取 +load 方法，保存到 loadable_classes 里
+	add_category_to_loadable_list()
+	  _category_getLoadMethod()  // 获取 +load 方法，保存到 loadable_categories 里
+      call_load_methods()
+        call_class_loads() 
+	  (*load_method)(cls, SEL_load) // 从 loadable_classes 中取出各个类，调用它们的 +load 方法
+	call_category_loads()
+	  (*load_method)(cls, SEL_load) // 从 loadable_categories 中取出各个 Category，调用它们的 +load 方法
+  
+```
+
+
+
+结论：
+
+- 先调用父类的 `+load` 方法，后调用子类的 `+load` 方法
+- Category 的 `+load` 方法会在它的主类的 `+load` 方法被调用之后才被调用
+- 不同的类之间的 `+load` 方法的调用顺序根据编译时的顺序(在 Xcode Build Phases 中可以看到)来确定的，靠前的先加载
+
+
+
+
+
+#### 15.2 `+initialize` 方法
+
+在处理消息发送的函数 `lookUpImpOrForward()` 中我们可以看到 initialize class 的逻辑：
+
+```
+IMP lookUpImpOrForward(Class cls, SEL sel, id inst, 
+                       bool initialize, bool cache, bool resolver)
+{
+    IMP imp = nil;
+    bool triedResolver = NO;
+
+		// 省略部分内容...
+		...
+
+    // 在 Objective-C 运行时 初始化的过程中（也就是libSystem 调用 _objc_init 函数时）会对其中的类进行第一次初始化也就是执行 realizeClass 方法，为类分配可读写结构体 class_rw_t 的空间，并返回正确的类结构体
+    if (!cls->isRealized()) {
+        // Drop the read-lock and acquire the write-lock.
+        // realizeClass() checks isRealized() again to prevent
+        // a race while the lock is down.
+        runtimeLock.unlockRead();
+        runtimeLock.write();
+
+        realizeClass(cls);
+
+        runtimeLock.unlockWrite();
+        runtimeLock.read();
+    }
+
+    // _class_initialize 方法会调用类的 initialize 方法，在这个类第一次被初始化时就会调用 initialize 方法
+    if (initialize  &&  !cls->isInitialized()) {
+        runtimeLock.unlockRead();
+        _class_initialize (_class_getNonMetaClass(cls, inst));
+        runtimeLock.read();
+        // If sel == initialize, _class_initialize will send +initialize and 
+        // then the messenger will send +initialize again after this 
+        // procedure finishes. Of course, if this is not being called 
+        // from the messenger then it won't happen. 2778172
+    }
+
+ 		// 省略后面的内容...
+ 		...
+ 		
+    return imp;
+}
+```
+
+通过阅读 runtime 源码，一个 ObjC 类的 `+initialize` 方法被调用的大概流程如下：
+
+```objective-c++
+objc_msgSend()
+  lookUpImpOrForward()
+    _class_initialize()
+      _class_initialize(supercls) // initialize 当前类之前确保先 initialize 父类
+      callInitialize()
+        ((void(*)(Class, SEL))objc_msgSend)(cls, SEL_initialize); // 调用 initialize 方法
+```
+
+
+
+结论：
+
+- `+initialize` 方法是在类或它的子类收到第一条消息之前被调用的，这里所指的消息包括实例方法和类方法的调用。也就是说 `+initialize` 方法是以懒加载的方式被调用的，如果程序一直没有给某个类或它的子类发送消息，那么这个类的 `+initialize` 方法是永远不会被调用的。
+
+- **跟 `+load` 方法是通过函数指针来直接调用不同，`+initialize` 方法的调用是通过 `objc_msgSend` 调用的，与普通方法的调用是一样的，走的都是发送消息的流程**。
+- 基于第二点，可以得出下面的结论：
+  - 如果子类没有实现 `+initialize` 方法，那么继承自父类的实现会被调用
+  - 如果一个子类没有实现 `+initialize` 方法，那么父类的实现会被执行多次
+  - 如果一个类的分类实现了 `+initialize` 方法，那么就会对这个类中的实现造成覆盖
+
+
+
 参考：
 - [Objective-C +load vs +initialize - 雷纯锋的技术博客](http://www.ds99.site/blog/2015/05/02/objective-c-plus-load-vs-plus-initialize/)
+- [NSObject +load and +initialize - What do they do?](https://stackoverflow.com/questions/13326435/nsobject-load-and-initialize-what-do-they-do?rq=1)
 - [孙源：iOS 程序 main 函数之前发生了什么](http://blog.sunnyxx.com/2014/08/30/objc-pre-main/)
 
 ### 延伸
